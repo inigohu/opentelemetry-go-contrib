@@ -21,6 +21,12 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// metricsInfo contains metrics information for an RPC.
+type metricsInfo struct {
+	msgReceived int64
+	msgSent     int64
+}
+
 // traceInfo contains tracing information for an RPC.
 type traceInfo struct {
 	name string
@@ -29,8 +35,15 @@ type traceInfo struct {
 
 // gRPCContext contains all the information needed to record metrics and traces.
 type gRPCContext struct {
-	traceInfo *traceInfo
-	attrs     []attribute.KeyValue
+	metricsInfo *metricsInfo
+	traceInfo   *traceInfo
+	attrs       []attribute.KeyValue
+}
+
+func AddAttrs(ctx context.Context, attrs ...attribute.KeyValue) context.Context {
+	gctx, _ := GRPCContextFromContext(ctx)
+	gctx.attrs = append(gctx.attrs, attrs...)
+	return ContextWithGRPCContext(ctx, gctx)
 }
 
 // Add attributes to a gRPCContext.
@@ -53,7 +66,8 @@ func GRPCContextFromContext(ctx context.Context) (*gRPCContext, bool) { // nolin
 	l, ok := ctx.Value(gRPCContextKey{}).(*gRPCContext)
 	if !ok {
 		l = &gRPCContext{
-			traceInfo: &traceInfo{},
+			metricsInfo: &metricsInfo{},
+			traceInfo:   &traceInfo{},
 		}
 	}
 	return l, ok

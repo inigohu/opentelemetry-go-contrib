@@ -16,6 +16,7 @@ package otelgrpc // import "go.opentelemetry.io/contrib/instrumentation/google.g
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -55,7 +56,8 @@ func (h *serverHandler) HandleConn(ctx context.Context, info stats.ConnStats) {
 
 // TagRPC can attach some information to the given context.
 func (h *serverHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
-	ctx = extract(ctx, h.config.Propagators)
+	fmt.Println("----------------- TagRPC -----------------")
+	ctx = extract(ctx, h.Propagators)
 
 	gctx, _ := GRPCContextFromContext(ctx)
 	gctx.traceInfo.kind = trace.SpanKindServer
@@ -90,7 +92,7 @@ func (h *clientHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) cont
 
 	ctx = h.tagRPC(ContextWithGRPCContext(ctx, gctx), info)
 
-	return inject(ctx, h.config.Propagators)
+	return inject(ctx, h.Propagators)
 }
 
 // HandleRPC processes the RPC stats.
@@ -116,57 +118,66 @@ func (c *config) tagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Con
 	gctx.traceInfo.name = name
 	gctx.attrs = append(gctx.attrs, attrs...)
 
+	if gctx.traceInfo.kind == trace.SpanKindServer {
+		ctx = trace.ContextWithRemoteSpanContext(ctx, trace.SpanContextFromContext(ctx))
+	}
+
+	ctx, _ = c.tracer.Start(
+		ctx,
+		gctx.traceInfo.name,
+		trace.WithSpanKind(gctx.traceInfo.kind),
+		trace.WithAttributes(gctx.attrs...),
+	)
+
 	return ContextWithGRPCContext(ctx, gctx)
 }
 
 func (c *config) handleRPC(ctx context.Context, rs stats.RPCStats) {
 	gctx, _ := GRPCContextFromContext(ctx)
-	if gctx.traceInfo.kind == trace.SpanKindServer {
-		ctx = trace.ContextWithRemoteSpanContext(ctx, trace.SpanContextFromContext(ctx))
-	}
+	span := trace.SpanFromContext(ctx)
 
-	ctx, span := c.tracer.Start(
-		ctx,
-		gctx.traceInfo.name,
-		trace.WithSpanKind(gctx.traceInfo.kind),
-	)
-
-	// access these counts atomically for hedging in the future
-	// number of messages sent from side (client || server)
-	var sentMsgs int64
-	// number of messages received on side (client || server)
-	var recvMsgs int64
+	var messageId int64
 
 	switch rs := rs.(type) {
 	case *stats.Begin:
+		fmt.Println("----------------- Begin -----------------")
 	case *stats.InPayload:
+		fmt.Println("----------------- InPayload -----------------")
+		messageId = atomic.AddInt64(&gctx.metricsInfo.msgReceived, 1)
+		c.rpcRequestSize.Record(ctx, int64(rs.Length), metric.WithAttributes(gctx.attrs...))
 		if c.ReceivedEvent {
 			span.AddEvent("message",
 				trace.WithAttributes(
 					semconv.MessageTypeReceived,
-					semconv.MessageIDKey.Int64(atomic.AddInt64(&recvMsgs, 1)),
+					semconv.MessageIDKey.Int64(messageId),
 					semconv.MessageCompressedSizeKey.Int(rs.CompressedLength),
 					semconv.MessageUncompressedSizeKey.Int(rs.Length),
 				),
 			)
 		}
 	case *stats.OutPayload:
+		fmt.Println("----------------- OutPayload -----------------")
+		messageId = atomic.AddInt64(&gctx.metricsInfo.msgSent, 1)
+		c.rpcResponseSize.Record(ctx, int64(rs.Length), metric.WithAttributes(gctx.attrs...))
 		if c.SentEvent {
 			span.AddEvent("message",
 				trace.WithAttributes(
 					semconv.MessageTypeSent,
-					semconv.MessageIDKey.Int64(atomic.AddInt64(&sentMsgs, 1)),
+					semconv.MessageIDKey.Int64(messageId),
 					semconv.MessageCompressedSizeKey.Int(rs.CompressedLength),
 					semconv.MessageUncompressedSizeKey.Int(rs.Length),
 				),
 			)
 		}
 	case *stats.OutTrailer:
+		fmt.Println("----------------- OutTrailer -----------------")
 	case *stats.OutHeader:
+		fmt.Println("----------------- OutHeader -----------------")
 		if p, ok := peer.FromContext(ctx); ok {
 			span.SetAttributes(peerAttr(p.Addr.String())...)
 		}
 	case *stats.End:
+		fmt.Println("----------------- End -----------------")
 		if rs.Error != nil {
 			s, _ := status.FromError(rs.Error)
 			if gctx.traceInfo.kind == trace.SpanKindServer {
@@ -187,10 +198,8 @@ func (c *config) handleRPC(ctx context.Context, rs stats.RPCStats) {
 		elapsedTime := float64(rs.EndTime.Sub(rs.BeginTime)) / float64(time.Millisecond)
 
 		c.rpcDuration.Record(ctx, elapsedTime, metric.WithAttributes(gctx.attrs...))
-		c.rpcRequestSize.Record(ctx, atomic.LoadInt64(&recvMsgs), metric.WithAttributes(gctx.attrs...))
-		c.rpcResponseSize.Record(ctx, atomic.LoadInt64(&sentMsgs), metric.WithAttributes(gctx.attrs...))
-		c.rpcRequestsPerRPC.Record(ctx, atomic.LoadInt64(&recvMsgs), metric.WithAttributes(gctx.attrs...))
-		c.rpcResponsesPerRPC.Record(ctx, atomic.LoadInt64(&sentMsgs), metric.WithAttributes(gctx.attrs...))
+		c.rpcRequestsPerRPC.Record(ctx, atomic.LoadInt64(&gctx.metricsInfo.msgReceived), metric.WithAttributes(gctx.attrs...))
+		c.rpcResponsesPerRPC.Record(ctx, atomic.LoadInt64(&gctx.metricsInfo.msgSent), metric.WithAttributes(gctx.attrs...))
 	default:
 		return
 	}
